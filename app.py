@@ -776,6 +776,85 @@ def jobs():
     
     return render_template('jobs.html', jobs=jobs)
 
+# === ADDED: Jobs quick-create (free board) without touching existing handlers
+@app.route('/jobs/new', methods=['GET', 'POST'])
+@login_required
+def jobs_new():
+    """
+    نموذج بسيط لإضافة فرصة عمل كـ Product تحت فئة 'فرص عمل' بحالة approved.
+    لا يغيّر أي دالة موجودة. واجهة مستقلة وخفيفة.
+    """
+    if request.method == 'POST':
+        try:
+            title = (request.form.get('title') or '').strip()
+            city = (request.form.get('city') or '').strip()
+            description = (request.form.get('description') or '').strip()
+            contact_email = (request.form.get('contact_email') or '').strip()
+            contact_phone = (request.form.get('contact_phone') or '').strip()
+
+            if not title or not city or not description:
+                flash('الحقول المطلوبة: المسمى الوظيفي، المدينة، الوصف', 'error')
+                return redirect(url_for('jobs_new'))
+
+            jobs_cat = Category.query.filter_by(name='فرص عمل').first()
+            if not jobs_cat:
+                flash('فئة "فرص عمل" غير موجودة', 'error')
+                return redirect(url_for('jobs'))
+
+            # نبني وصفًا يحتوي المدينة وطرق التواصل
+            full_desc = f"{description}\n\nالمدينة: {city}"
+            if contact_email: full_desc += f"\nالبريد: {contact_email}"
+            if contact_phone: full_desc += f"\nالهاتف: {contact_phone}"
+
+            product = Product()
+            product.name = title
+            product.description = full_desc
+            product.price = 0.0
+            product.category_id = jobs_cat.id
+            product.image_url = None
+            product.user_id = current_user.id
+            product.status = 'approved'
+
+            db.session.add(product)
+            db.session.commit()
+            flash('تم نشر فرصة العمل بنجاح', 'success')
+            return redirect(url_for('jobs'))
+
+        except Exception as e:
+            logger.error(f"Jobs new error: {str(e)}")
+            db.session.rollback()
+            flash('حدث خطأ أثناء نشر فرصة العمل', 'error')
+            return redirect(url_for('jobs_new'))
+
+    # GET form بسيط
+    return ("""
+<!doctype html><meta charset="utf-8">
+<title>إضافة فرصة عمل</title>
+<div style="max-width:760px;margin:24px auto;font-family:system-ui;">
+  <h2>إضافة فرصة عمل</h2>
+  <form method="post">
+    <label>المسمى الوظيفي*</label>
+    <input name="title" required style="width:100%;padding:8px;margin:6px 0">
+    <label>المدينة*</label>
+    <input name="city" required style="width:100%;padding:8px;margin:6px 0" placeholder="Nürnberg">
+    <label>الوصف*</label>
+    <textarea name="description" required rows="6" style="width:100%;padding:8px;margin:6px 0"></textarea>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div>
+        <label>البريد للتواصل</label>
+        <input name="contact_email" style="width:100%;padding:8px;margin:6px 0">
+      </div>
+      <div>
+        <label>الهاتف للتواصل</label>
+        <input name="contact_phone" style="width:100%;padding:8px;margin:6px 0">
+      </div>
+    </div>
+    <button type="submit" style="padding:10px 16px;border:0;background:#06b6d4;color:#001;border-radius:8px">نشر</button>
+    <a href="/jobs" style="margin-left:8px">رجوع</a>
+  </form>
+</div>
+""")
+
 # ===== Admin Routes =====
 
 @app.route('/admin')
@@ -1545,6 +1624,71 @@ def get_messages(product_id):
     except Exception as e:
         logger.error(f"Chat history error: {str(e)}")
         return jsonify({'success': False, 'message': 'حدث خطأ أثناء جلب المحادثة'})
+
+# === ADDED: Ultra-fast polling endpoint (no changes to existing functions)
+@app.get('/api/chat/poll')
+@login_required
+def chat_poll():
+    """
+    يرجّع الرسائل الجديدة لمنتج محدد منذ توقيت after.
+    الاستعمال من الواجهة:
+      GET /api/chat/poll?product_id=123&after=2025-10-02T08:10:00Z
+      أو after كـ epoch ms: after=1696234200000
+    رجوع Array لرسائل جديدة فقط.
+    """
+    try:
+        from sqlalchemy import text
+        product_id = request.args.get('product_id', type=int)
+        after = request.args.get('after', type=str)
+
+        if not product_id:
+            return jsonify({'success': False, 'message': 'product_id مطلوب'}), 400
+
+        # Parse 'after'
+        after_dt = None
+        if after:
+            try:
+                if after.isdigit():
+                    # epoch ms
+                    after_ms = int(after)
+                    after_dt = datetime.utcfromtimestamp(after_ms / 1000.0)
+                else:
+                    # ISO
+                    after_dt = datetime.fromisoformat(after.replace('Z', '+00:00'))
+            except Exception:
+                after_dt = None
+
+        if after_dt is None:
+            # default: آخر 2 دقيقة لسرعة البدء
+            after_dt = datetime.utcnow() - timedelta(minutes=2)
+
+        q = text("""
+            SELECT cm.id, cm.sender_id, cm.receiver_id, cm.message, cm.timestamp,
+                   u.fullname AS sender_name
+            FROM chat_messages cm
+            JOIN users u ON cm.sender_id = u.id
+            WHERE cm.product_id = :pid
+              AND cm.timestamp > :after_ts
+            ORDER BY cm.timestamp ASC
+            LIMIT 200
+        """)
+        rows = db.session.execute(q, {'pid': product_id, 'after_ts': after_dt}).fetchall()
+
+        out = []
+        for r in rows:
+            out.append({
+                'id': r[0],
+                'sender_id': r[1],
+                'receiver_id': r[2],
+                'content': r[3],
+                'timestamp': r[4].isoformat() if hasattr(r[4], 'isoformat') else str(r[4]),
+                'sender_name': r[5],
+            })
+        return jsonify({'success': True, 'messages': out})
+
+    except Exception as e:
+        logger.error(f"chat_poll error: {str(e)}")
+        return jsonify({'success': False, 'messages': []})
 
 @app.route('/api/chat/unread_count')
 @login_required
